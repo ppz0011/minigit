@@ -69,7 +69,9 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
         "add" => {
             add(&config.argument)
         },
-        "rm" => todo!(),
+        "rm" => {
+            rm(&config.argument)
+        },
         "commit" => todo!(),
         "branch" => todo!(),
         "checkout" => todo!(),
@@ -323,7 +325,7 @@ fn add(paths: &Vec<String>)-> Result<(), Box<dyn Error>> {
 
 
 fn remove_index(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Error>> {
-    let mut path_str = path.as_os_str().as_encoded_bytes().to_vec();
+    let path_str = path.as_os_str().as_encoded_bytes().to_vec();
     let index_path = minigit_path.join("index");
     let mut index = File::open(&index_path)?;
     let mut buf = Vec::new();
@@ -354,10 +356,10 @@ fn remove_tree(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Erro
     for entry in path.read_dir()? {
         let child_path = &entry?.path();
         if child_path.is_file() {
-            remove_tree(minigit_path, child_path)?;
+            remove_blob(minigit_path, child_path)?;
         }
         else {
-            remove_blob(minigit_path, child_path)?;
+            remove_tree(minigit_path, child_path)?;
         }
     }
     remove_dir(path)?;
