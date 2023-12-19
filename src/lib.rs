@@ -594,12 +594,15 @@ fn branch_check()-> Result<(), Box<dyn Error>> {
     let minigit_path = find_minigit(&env::current_dir()?)?;
     let branchs_path = minigit_path.join("refs").join("heads");
     let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    let now_branch_name = now_branch_name[11..].to_string();
     for entry in branchs_path.read_dir()? {
         let branch_name = entry?.file_name().into_string().unwrap();
         if branch_name == now_branch_name {
-            print!("* ");
+            println!("* {}",branch_name);
         }
-        println!("{}",branch_name);
+        else{
+            println!(" {}",branch_name);
+        }
     }
     Ok(())
 }
@@ -608,13 +611,14 @@ fn branch_delete(name: &String)-> Result<(), Box<dyn Error>> {
     let minigit_path = find_minigit(&env::current_dir()?)?;
     let branchs_path = minigit_path.join("refs").join("heads");
     let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    let now_branch_name = now_branch_name[11..].to_string();
     if &now_branch_name == name {
         return Err("delete branch failed: can't delete now branch".into());
     }
     for entry in branchs_path.read_dir()? {
         let entry = entry?;
         let branch_name = entry.file_name().into_string().unwrap();
-        if branch_name == now_branch_name {
+        if &branch_name == name {
             fs::remove_file(entry.path())?;
             return Ok(());
         }
@@ -715,10 +719,13 @@ mod test{
     #[test]
     fn test_branch()-> Result<(), Box<dyn Error>> {
         test_commit()?;
+        println!("before create");
         branch_check()?;
         branch_create(&"second_branch".to_string())?;
+        println!("after create");
         branch_check()?;
         branch_delete(&"second_branch".to_string())?;
+        println!("after delete");
         branch_check()?;
         Ok(())
     }

@@ -7,6 +7,7 @@ fn main() {
         eprintln!("Error at input argument: {err}");
         process::exit(1);
     });
+    env::set_current_dir(&env::current_dir().unwrap().join("test"));
     if let Err(err) = minigit::run(&config){
         eprintln!("Error at make operator: {err}");
         process::exit(1);
