@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::{env,fs, path};
 use std::fs::{File, OpenOptions, remove_file, remove_dir};
 use std::error::Error;
@@ -7,6 +7,7 @@ use std::io::{Write, Read};
 use std::path::{Path, PathBuf};
 use crypto::{sha1::Sha1, digest::Digest};
 use flate2::{Compression, read::ZlibEncoder};
+use chrono::{DateTime, Utc};
 
 #[derive(Debug)]
 pub struct Config{
@@ -64,20 +65,30 @@ impl Config{
 pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
     match &config.operate as &str{
         "init" => {
-            init(&config.argument[0])
+            init(&config.argument[0])?;
         },
         "add" => {
-            add(&config.argument)
+            add(&config.argument)?;
+            println!("Successed add file: {:?}",&config.argument);
         },
         "rm" => {
-            rm(&config.argument)
+            rm(&config.argument)?;
+            println!("Successed remove file: {:?}",&config.argument);
         },
-        "commit" => todo!(),
-        "branch" => todo!(),
+        "commit" => {
+            let author = env::var("USERNAME")?;
+            commit(&author, &config.argument[0])?;
+            println!("Successed commit repository with message: \"{}\"",&config.argument[0]);
+        },
+        "branch" => {
+            branch_check()?;
+            branch_delete(&"second_branch".to_string())?;
+        },
         "checkout" => todo!(),
         "merge" => todo!(),
-        _=> Err("inviald operater string".into()),
+        _=> return Err("inviald operater string".into()),
     }
+    Ok(())
 }
 
 
@@ -106,7 +117,7 @@ fn init(name: &String)-> Result<(), Box<dyn Error>>{
     fs::create_dir(path.join("objects"))?;
     File::create(path.join("index"))?;
     let mut head = File::create(path.join("HEAD"))?;
-    head.write_all("ref: refs/heads/master".as_bytes())?;
+    head.write_all("refs/heads/master".as_bytes())?;
     if is_first { 
         println!("Initialized empty Git repository in {}",path.to_str().unwrap());
     }
@@ -143,12 +154,156 @@ fn find_minigit(path: &PathBuf)-> Result<PathBuf, Box<dyn Error>>{
             break;
         }
     }
-    return Err("failed find minigit".into());
+    return Err("failed find minigit repository".into());
 }
 
 
 
-fn save_value(path: &PathBuf, minigit_path: &PathBuf,value: &Vec<u8>)-> Result<String, Box<dyn Error>> {
+fn find_index(buf: &Vec<Vec<u8>>, path_str: &Vec<u8>)-> (usize, i32) {
+    if buf.len() == 0 {
+        return (0,-1);
+    }
+    let mut start: usize = 0;
+    let mut end: usize = buf.len() - 1;
+    while start <= end {
+        let mid: usize = (end + start) / 2;
+        let mid_path = buf[mid].clone();
+        let (mid_path,_) = mid_path.split_at(mid_path.iter().position(|&x| x == b' ').unwrap());
+        let mid_path = mid_path.to_vec();
+        match mid_path.cmp(&path_str) {
+            Ordering::Less=> {
+                start = mid + 1;
+            }
+            Ordering::Greater=> {
+                if mid == 0 {
+                    return (0, -1);
+                }
+                end = mid - 1;
+            }
+            Ordering::Equal=> { 
+                break;
+            }
+        }
+    }
+    (start, end as i32)
+}
+
+/**
+ * 从路径path开始通过index里面的记录而不是文件系统来更新index内容（即buf）
+ * 
+ */
+fn updata_index(buf: &mut Vec<Vec<u8>>, path: &PathBuf, root_path: &Path)-> Result<(), Box<dyn Error>> {
+    let path = match path.parent() {
+        None => return Err("updata index file failed: path don't have enough ancestor to minigit path's parent".into()),
+        Some(p)=> p.to_path_buf(),
+    };
+    if !path.starts_with(root_path) {
+        return Ok(());
+    }
+    // 根据index里面的记录而不是实际文件系统来更新path_ancestor
+    let path_str = path.as_os_str().as_encoded_bytes().to_vec();
+    let (start, end) = find_index(buf, &path_str);
+    let mut find_ptr = start;
+    if start as i32 <= end {
+        find_ptr = (start + end as usize) / 2 + 1;
+    }
+    let buf_len = buf.len();
+    let mut value = b"tree\0".to_vec();
+    while find_ptr < buf_len {
+        let find_position = buf[find_ptr].iter().position(|&b| b == b' ').unwrap();
+        let find_path = &buf[find_ptr][0..find_position];
+        if !find_path.starts_with(&path_str) {
+            break;
+        }
+        let last_separator_index = find_path.windows(path::MAIN_SEPARATOR_STR.len()).rposition(|str| str == path::MAIN_SEPARATOR_STR.as_bytes()).unwrap();
+        if find_path[0..last_separator_index] != path_str {
+            find_ptr = find_ptr + 1;
+            continue;
+        }
+        let mut find_key = buf[find_ptr][(find_position + 1)..].to_vec();
+        let mut file_name = find_path[(last_separator_index + 1)..].to_vec();
+        value.append(&mut find_key);
+        value.push(b' ');
+        value.append(&mut file_name);
+        value.append(&mut "\0".as_bytes().to_vec());
+        find_ptr = find_ptr + 1;
+    }
+    let key = save_value(&root_path.join(".minigit"), &value)?;
+    let mut add_information = format!(" tree {key}").into_bytes();
+    let mut path_str = path.as_os_str().as_encoded_bytes().to_vec();
+    path_str.append(&mut add_information);
+    if start as i32 <= end {
+        buf[(start + end as usize) / 2] = path_str;
+    }
+    else {
+        buf.insert(start, path_str);
+    }
+    updata_index(buf, &path, root_path)
+}
+
+fn start_updata_index(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Error>> {
+    let root_path = match minigit_path.parent() {
+        None=> return Err("update index file failed: minigit path have no parent".into()),
+        Some(p)=> p,
+    };
+    let index_path = minigit_path.join("index");
+    let mut read = fs::read(&index_path)?;
+    let mut buf = [[].to_vec();0].to_vec();
+    if !read.is_empty() {
+        read.pop();
+        buf = read.split(|&x| x == b'\n').map(|bytes| bytes.to_vec()).collect::<Vec<Vec<u8>>>();
+    }
+    // 接下来应该更新此路径上全部的key
+    updata_index(&mut buf, path, root_path)?;
+    // 最后将index清空后将buf写入index文件
+    let buf: Vec<u8> = buf.iter().flat_map(|v| {let mut w = v.clone(); w.push(b'\n'); w}).collect();
+    let mut index = File::create(&index_path)?;
+    index.write_all(&buf)?;
+    Ok(())
+}
+
+
+fn insert_index(minigit_path: &PathBuf, path: &PathBuf,key: &String)-> Result<(),Box<dyn Error>> {
+    let mut path_type = "tree";
+    if path.is_file() {
+        path_type = "blob";
+    }
+    let mut add_information = format!(" {path_type} {key}").into_bytes();
+    let mut path_str = path.as_os_str().as_encoded_bytes().to_vec();
+    let index_path = minigit_path.join("index");
+    let mut index = File::open(&index_path)?;
+    let mut read = Vec::new();
+    index.read_to_end(&mut read)?;
+    let mut buf;
+    if !read.is_empty() {
+        read.pop();
+        buf = read.split(|&x| x == b'\n').map(|bytes| bytes.to_vec()).collect::<Vec<Vec<u8>>>();
+        let (start, end) = find_index(&buf, &path_str);
+        if start as i32 > end {
+            path_str.append(&mut add_information);
+            buf.insert(start, path_str);
+        }
+        else { // start <= end 说明此时buf[(start + end) / 2]的路径与path_str一样，该更新而不是插入
+            path_str.append(&mut add_information);
+            let mid = (start + end as usize) / 2;
+            buf[mid] = path_str;
+        }
+    }
+    else {
+        path_str.append(&mut add_information);
+        buf = [path_str;1].to_vec();
+    }
+    let buf: Vec<u8> = buf.iter().flat_map(|v| {let mut w = v.clone(); w.push(b'\n'); w}).collect();
+    let mut index = File::create(&index_path)?;
+    index.write_all(&buf)?;
+    Ok(())
+}
+
+
+
+
+
+fn save_value(minigit_path: &PathBuf,value: &Vec<u8>)-> Result<String, Box<dyn Error>> {
     if !minigit_path.is_dir() {
         return Err(".minigit doesn't exists".into());
     }
@@ -164,7 +319,6 @@ fn save_value(path: &PathBuf, minigit_path: &PathBuf,value: &Vec<u8>)-> Result<S
     if !save_path.is_file(){ 
         let mut save_file = File::create(save_path)?;
         save_file.write_all(value)?;
-        insert_index(minigit_path,path,&String::from(key))?;
     }
     Ok(String::from(key))
 }
@@ -176,7 +330,8 @@ fn save_blob(path: &PathBuf, minigit_path: &PathBuf)-> Result<String, Box<dyn Er
     let mut value = Vec::new();
     value.append(&mut "blob\0".as_bytes().to_vec());
     zlib.read_to_end(&mut value)?;
-    let key = save_value(path, minigit_path, &value)?;
+    let key = save_value(minigit_path, &value)?;
+    insert_index(minigit_path, path, &key)?;
     Ok(key)
 }
 
@@ -184,7 +339,7 @@ fn save_tree(path: &PathBuf, minigit_path: &PathBuf)-> Result<String, Box<dyn Er
     let mut value = Vec::new();
     value.append(&mut "tree\0".as_bytes().to_vec());
     for entry in path.read_dir()? {
-        let key;
+        let key: String;
         let child_type;
         let child_path = entry?.path();
         let child_name = child_path.file_name();
@@ -204,69 +359,17 @@ fn save_tree(path: &PathBuf, minigit_path: &PathBuf)-> Result<String, Box<dyn Er
         value.append(&mut child_name.as_encoded_bytes().to_vec());
         value.append(&mut "\0".as_bytes().to_vec());
     }
-    let dir_key = save_value(path, minigit_path, &value)?;
+    let dir_key = save_value(minigit_path, &value)?;
+    insert_index(minigit_path,path,&dir_key)?;
     Ok(dir_key)
 }
 
-fn find_index(buf: &Vec<Vec<u8>>, path_str: &Vec<u8>)-> (usize, usize) {
-    let mut start: usize = 0;
-    let mut end: usize = buf.len() - 1;
-    while start <= end {
-        let mid: usize = (end + start) / 2;
-        let mid_path = buf[mid].clone();
-        let (mid_path,_) = mid_path.split_at(mid_path.iter().position(|&x| x == b' ').unwrap());
-        let mid_path = mid_path.to_vec();
-        match mid_path.cmp(&path_str) {
-            Ordering::Less=> {
-                start = mid + 1;
-            }
-            Ordering::Greater=> {
-                end = mid - 1;
-            }
-            Ordering::Equal=> { 
-                break;
-            }
-        }
-    }
-    (start, end)
-}
-
-fn insert_index(minigit_path: &PathBuf, path: &PathBuf,key: &String)-> Result<(),Box<dyn Error>> {
-    let mut add_information = format!(" {key}").into_bytes();
-    let mut path_str = path.as_os_str().as_encoded_bytes().to_vec();
-    let index_path = minigit_path.join("index");
-    let mut index = File::open(&index_path)?;
-    let mut buf = Vec::new();
-    index.read_to_end(&mut buf)?;
-    if buf.is_empty() {
-        path_str.append(&mut add_information);
-        path_str.push(b'\n');
-        let mut index = File::create(&index_path)?;
-        index.write_all(&path_str)?;
-        return Ok(());
-    }
-    let mut buf = buf.split(|&x| x == b'\n').map(|bytes| bytes.to_vec()).collect::<Vec<Vec<u8>>>();
-    buf.pop();
-    let (start, end) = find_index(&buf, &path_str);
-    if start > end {
-        path_str.append(&mut add_information);
-        buf.insert(start, path_str);
-    }
-    else { // start <= end 说明此时buf[(start + end) / 2]的路径与path_str一样，该更新而不是插入
-        path_str.append(&mut add_information);
-        buf[(start + end) / 2] = path_str;
-    }
-    let buf: Vec<u8> = buf.iter().flat_map(|v| {let mut w = v.clone(); w.push(b'\n'); w}).collect();
-    let mut index = File::create(&index_path)?;
-    index.write_all(&buf)?;
-    Ok(())
-}
 
 fn save_object(path: &PathBuf)-> Result<(), Box<dyn Error>> {
-    let minigit_path = find_minigit(&path)?;
+    let minigit_path = &find_minigit(&path)?;
     let ignore = OsStr::new(".minigit");
     if path.is_file() {
-        save_blob(path, &minigit_path)?;
+        save_blob(path, minigit_path)?;
     }
     else if path.is_dir() {
         match path.file_name() {
@@ -275,14 +378,14 @@ fn save_object(path: &PathBuf)-> Result<(), Box<dyn Error>> {
                 if name == ignore {
                     return Ok(());
                 }
-                save_tree(path, &minigit_path)?;
+                save_tree(path, minigit_path)?;
             }
         }
     }
     else {
         return Err("save_object failed: Invaid path".into())
     }
-    Ok(())
+    start_updata_index(minigit_path,path)
 }
 
 
@@ -330,29 +433,34 @@ fn remove_index(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Err
     let mut index = File::open(&index_path)?;
     let mut buf = Vec::new();
     index.read_to_end(&mut buf)?;
-    if buf.is_empty() {
-        return Ok(());
+    if buf.len() > 0 {
+        buf.pop();
     }
     let mut buf = buf.split(|&x| x == b'\n').map(|bytes| bytes.to_vec()).collect::<Vec<Vec<u8>>>();
-    buf.pop();
     let (start, end) = find_index(&buf, &path_str);
-    if start <= end {
-        buf.remove((start + end) / 2);
-        let buf: Vec<u8> = buf.iter().flat_map(|v| {let mut w = v.clone(); w.push(b'\n'); w}).collect();
-        let mut index = File::create(&index_path)?;
-        index.write_all(&buf)?;
+    if start as i32 <= end {
+        buf.remove((start + end as usize) / 2);
     }
+    // 接下来应该更新此路径上全部的key
+    let root_path = match minigit_path.parent() {
+        None=> return Err("update index file failed: minigit path have no parent".into()),
+        Some(p)=> p,
+    };
+    updata_index(&mut buf, path, root_path)?;
+    // 最后将index清空后将buf写入index文件
+    let buf: Vec<u8> = buf.iter().flat_map(|v| {let mut w = v.clone(); w.push(b'\n'); w}).collect();
+    let mut index = File::create(&index_path)?;
+    index.write_all(&buf)?;
     Ok(())
 }
 
 fn remove_blob(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Error>> {
-    remove_index(minigit_path, path)?;
     remove_file(path)?;
+    remove_index(minigit_path, path)?;
     Ok(())
 }
 
 fn remove_tree(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Error>> {
-    remove_index(minigit_path, path)?;
     for entry in path.read_dir()? {
         let child_path = &entry?.path();
         if child_path.is_file() {
@@ -363,6 +471,7 @@ fn remove_tree(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Erro
         }
     }
     remove_dir(path)?;
+    remove_index(minigit_path, path)?;
     Ok(())
 }
 
@@ -387,7 +496,7 @@ fn remove_object(path: &PathBuf)-> Result<(), Box<dyn Error>> {
     else {
         return Err("save_object failed: Invaid path".into())
     }
-    Ok(())
+    start_updata_index(minigit_path,path)
 }
 
 
@@ -423,16 +532,107 @@ fn rm(paths: &Vec<String>)->Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn commit(){}
 
-fn branch(){}
+
+
+fn create_tree_from_index(minigit_path: &PathBuf)-> Result<Vec<u8>, Box<dyn Error>> {
+    let index_path = minigit_path.join("index");
+    if !index_path.is_file() {
+        return Err("commit failed: no such index file".into());
+    }
+    let mut index = File::open(index_path)?;
+    let mut buf = [0;256];
+    let n = index.read(&mut buf)?;
+    if n == 0 {
+        return Ok("\0".as_bytes().to_vec());
+    }
+    let start = buf.iter().position(|&b| b == b' ').unwrap() + 6;
+    let end = buf.iter().position(|&b| b == b'\n').unwrap();
+    let key = buf[start..end].to_vec();
+    Ok(key)
+}
+
+
+fn commit(author: &String, message: &String)-> Result<(), Box<dyn Error>> {
+    let minigit_path = &find_minigit(& env::current_dir()?)?;
+    let mut tree_key = create_tree_from_index(minigit_path)?;
+    let mut head = File::open(minigit_path.join("HEAD"))?;
+    let mut current_commit = String::new();
+    head.read_to_string(&mut current_commit)?;
+    let current_commit = minigit_path.join(&current_commit);
+    let mut parent_commit = String::new();
+    if !current_commit.is_file() {
+        parent_commit = "\0".to_string();
+    }
+    else {
+        let mut head = File::open(&current_commit)?;
+        head.read_to_string(&mut parent_commit)?;
+    }
+    let now: DateTime<Utc> = Utc::now();
+    let mut commit_value = format!("commit\0parent {parent_commit}\nauthor {author}\ndatetime {now}\n note {message}\n tree ").into_bytes();
+    commit_value.append(&mut tree_key);
+    let key = save_value(minigit_path, &commit_value)?;
+    let mut head = File::create(&current_commit)?;
+    head.write_all(&key.into_bytes())?;
+    Ok(())
+}
+
+
+fn branch_create(name: &String)-> Result<(), Box<dyn Error>> {
+    let minigit_path = find_minigit(&env::current_dir()?)?;
+    let branch_path = minigit_path.join("refs").join("heads").join(name);
+    if branch_path.is_file() {
+        return Err("create branch failed: branch {name} is existing, you can't create a existing branch".into());
+    }
+    let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    let last_commit_key = fs::read(minigit_path.join(&now_branch_name))?;
+    fs::write(branch_path, last_commit_key)?;
+    Ok(())
+}
+
+fn branch_check()-> Result<(), Box<dyn Error>> {
+    let minigit_path = find_minigit(&env::current_dir()?)?;
+    let branchs_path = minigit_path.join("refs").join("heads");
+    let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    for entry in branchs_path.read_dir()? {
+        let branch_name = entry?.file_name().into_string().unwrap();
+        if branch_name == now_branch_name {
+            print!("* ");
+        }
+        println!("{}",branch_name);
+    }
+    Ok(())
+}
+
+fn branch_delete(name: &String)-> Result<(), Box<dyn Error>> {
+    let minigit_path = find_minigit(&env::current_dir()?)?;
+    let branchs_path = minigit_path.join("refs").join("heads");
+    let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    if &now_branch_name == name {
+        return Err("delete branch failed: can't delete now branch".into());
+    }
+    for entry in branchs_path.read_dir()? {
+        let entry = entry?;
+        let branch_name = entry.file_name().into_string().unwrap();
+        if branch_name == now_branch_name {
+            fs::remove_file(entry.path())?;
+            return Ok(());
+        }
+    }
+    return Err("delete branch failed: no such branch".into());
+}
 
 fn checkout(){}
 
 fn merge(){}
 
+
+
+
 #[cfg(test)]
 mod test{
+    use chrono::Timelike;
+
     use super::*;
     #[test]
     fn test_build(){
@@ -491,24 +691,42 @@ mod test{
 
     #[test]
     fn test_rm()-> std::io::Result<()>{
-        let name = "test".to_string();
-        init(&name).unwrap_or_else(|err|{
-            eprintln!("error at test_add: {err}");
-        });
-        let mut path = env::current_dir().unwrap().join(name);
-        env::set_current_dir(&path)?;
-        let mut file1 = File::create(path.join("1.txt")).unwrap();
-        file1.write_all(b"Hello First World!")?;
-        path = path.join("test_dir");
-        fs::create_dir_all(&path)?;
-        let mut file2 = File::create(path.join("2.txt")).unwrap();
-        file2.write_all(b"Hello Second World!")?;
-        add(&vec!["*".to_string()]).unwrap_or_else(|err|{
-            eprintln!("error at test_add: {err}");
-        });
-        rm(&vec!["*".to_string()]).unwrap_or_else(|err| {
-            eprintln!("error at test_add: {err}");
+        test_add()?;
+        rm(&vec!["test_dir\\2.txt".to_string()]).unwrap_or_else(|err| {
+            eprintln!("error at test_rm: {err}");
         });
         Ok(())
+    }
+
+    #[test]
+    fn test_commit()-> std::io::Result<()> {
+        test_add()?;
+        rm(&vec!["test_dir\\2.txt".to_string()]).unwrap_or_else(|err|{
+            eprintln!("error at test_rm: {err}");
+        });
+        let author_name = "master".to_string();
+        let message = "test first commit".to_string();
+        commit(&author_name, &message).unwrap_or_else(|err|{
+            eprintln!("error at test_commit: {err}");
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn test_branch()-> Result<(), Box<dyn Error>> {
+        test_commit()?;
+        branch_check()?;
+        branch_create(&"second_branch".to_string())?;
+        branch_check()?;
+        branch_delete(&"second_branch".to_string())?;
+        branch_check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test() {
+        for (key, value) in env::vars() {
+            println!("{}: {}",key,value);
+        }
     }
 }

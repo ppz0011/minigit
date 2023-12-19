@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 rust-crypto = "0.2.36"
 flate2 = "1.0.28"
+chrono = "0.4.31"

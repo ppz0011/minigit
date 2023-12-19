@@ -7,7 +7,7 @@
       "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}/target/debug/${workspaceFolderBasename}.exe",
-      "args": ["rm","test\\."],
+      "args": ["branch",""],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
       "environment": [],
