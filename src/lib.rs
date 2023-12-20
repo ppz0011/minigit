@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::{env,fs, path};
-use std::fs::{File, OpenOptions, remove_file, remove_dir};
+use std::fs::File;
 use std::error::Error;
 use std::io::{Write, Read};
 use std::path::{Path, PathBuf};
 use crypto::{sha1::Sha1, digest::Digest};
-use flate2::{Compression, read::ZlibEncoder};
+use flate2::{Compression, read::ZlibEncoder, write::ZlibDecoder};
 use chrono::{DateTime, Utc};
 
 #[derive(Debug)]
@@ -65,6 +65,9 @@ impl Config{
 pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
     match &config.operate as &str{
         "init" => {
+            if config.argument.is_empty() {
+                return Err("minigit init failed: repository name is empty".into());
+            }
             init(&config.argument[0])?;
         },
         "add" => {
@@ -76,15 +79,42 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
             println!("Successed remove file: {:?}",&config.argument);
         },
         "commit" => {
+            let mut message = &String::new();
+            if !config.argument.is_empty() {
+                message = &config.argument[0];
+            }
             let author = env::var("USERNAME")?;
-            commit(&author, &config.argument[0])?;
+            commit(&author, message)?;
             println!("Successed commit repository with message: \"{}\"",&config.argument[0]);
         },
         "branch" => {
-            branch_check()?;
-            branch_delete(&"second_branch".to_string())?;
+            let arg = &config.argument;
+            if arg.is_empty() {
+                branch_check()?;
+            }
+            else if arg[0] == "-v".to_string() {
+                if arg.len() < 2 {
+                    return Err("minigit branch failed: branch name is empty".into());
+                }
+                branch_delete(&arg[1])?;
+            }
+            else {
+                branch_create(&arg[0])?;
+            }
         },
-        "checkout" => todo!(),
+        "checkout" => {
+            let arg = &config.argument;
+            let n = arg.len();
+            if n == 0 {
+                return Err("minigit checkout failed: branch name is empty".into());
+            }
+            else if n >= 2 && arg[0] == "-b"{
+                checkout_new_branch(&arg[1])?;
+            }
+            else{
+                checkout(&arg[0])?;
+            }
+        },
         "merge" => todo!(),
         _=> return Err("inviald operater string".into()),
     }
@@ -117,7 +147,7 @@ fn init(name: &String)-> Result<(), Box<dyn Error>>{
     fs::create_dir(path.join("objects"))?;
     File::create(path.join("index"))?;
     let mut head = File::create(path.join("HEAD"))?;
-    head.write_all("refs/heads/master".as_bytes())?;
+    head.write_all("master".as_bytes())?;
     if is_first { 
         println!("Initialized empty Git repository in {}",path.to_str().unwrap());
     }
@@ -326,9 +356,9 @@ fn save_value(minigit_path: &PathBuf,value: &Vec<u8>)-> Result<String, Box<dyn E
 fn save_blob(path: &PathBuf, minigit_path: &PathBuf)-> Result<String, Box<dyn Error>> {
     let file = File::open(path)?;
     // 将path代表的文件的二进制内容使用zlib压缩并且存入字符动态数组value中
-    let mut zlib = ZlibEncoder::new(file, Compression::fast());
     let mut value = Vec::new();
     value.append(&mut "blob\0".as_bytes().to_vec());
+    let mut zlib = ZlibEncoder::new(file, Compression::fast());
     zlib.read_to_end(&mut value)?;
     let key = save_value(minigit_path, &value)?;
     insert_index(minigit_path, path, &key)?;
@@ -367,19 +397,42 @@ fn save_tree(path: &PathBuf, minigit_path: &PathBuf)-> Result<String, Box<dyn Er
 
 fn save_object(path: &PathBuf)-> Result<(), Box<dyn Error>> {
     let minigit_path = &find_minigit(&path)?;
-    let ignore = OsStr::new(".minigit");
+    if path == minigit_path {
+        return Ok(());
+    }
+    if path.starts_with(minigit_path) {
+        return Err("save_object failed: can't save sub path of minigit path".into());
+    }
     if path.is_file() {
         save_blob(path, minigit_path)?;
     }
     else if path.is_dir() {
-        match path.file_name() {
-            None => return Err("save_object failed:path is dir but can't get file name".into()), 
-            Some(name)=> {
-                if name == ignore {
-                    return Ok(());
+        let repository_path = match minigit_path.parent() {
+            None => return Err("save_object failed: can't get repository path from minigit path".into()), 
+            Some(father)=> father,
+        };
+        if path == repository_path {
+            let ignore = OsStr::new(".minigit");
+            for entry in path.read_dir()? {
+                let entry = entry?;
+                if entry.file_name() != ignore {
+                    let file_type = entry.file_type()?;
+                    if file_type.is_dir() {
+                        save_tree(&entry.path(), minigit_path)?;
+                    }
+                    else if file_type.is_file() {
+                        save_blob(&entry.path(), minigit_path)?;
+                    }
+                    else {
+                        return Err("save object failed: can't save symlink file".into());
+                    }
+                    
                 }
-                save_tree(path, minigit_path)?;
             }
+            return start_updata_index(minigit_path, minigit_path);
+        }
+        else {
+            save_tree(path, minigit_path)?;
         }
     }
     else {
@@ -455,7 +508,7 @@ fn remove_index(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Err
 }
 
 fn remove_blob(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Error>> {
-    remove_file(path)?;
+    fs::remove_file(path)?;
     remove_index(minigit_path, path)?;
     Ok(())
 }
@@ -470,31 +523,53 @@ fn remove_tree(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Erro
             remove_tree(minigit_path, child_path)?;
         }
     }
-    remove_dir(path)?;
+    fs::remove_dir(path)?;
     remove_index(minigit_path, path)?;
     Ok(())
 }
 
 
 fn remove_object(path: &PathBuf)-> Result<(), Box<dyn Error>> {
-    let minigit_path = &find_minigit(path)?;
-    let ignore = OsStr::new(".minigit");
+    let minigit_path = &find_minigit(&path)?;
+    if path == minigit_path {
+        return Ok(());
+    }
+    if path.starts_with(minigit_path) {
+        return Err("remove_object failed: can't delete sub path of minigit path".into());
+    }
     if path.is_file() {
         remove_blob(minigit_path, path)?;
     }
     else if path.is_dir() {
-        match path.file_name() {
-            None => return Err("save_object failed:path is dir but can't get file name".into()), 
-            Some(name)=> {
-                if name == ignore {
-                    return Ok(());
+        let repository_path = match minigit_path.parent() {
+            None => return Err("remove_object failed: can't get repository path from minigit path".into()), 
+            Some(father)=> father,
+        };
+        if path == repository_path {
+            let ignore = OsStr::new(".minigit");
+            for entry in path.read_dir()? {
+                let entry = entry?;
+                if entry.file_name() != ignore {
+                    let file_type = entry.file_type()?;
+                    if file_type.is_dir() {
+                        remove_tree(minigit_path, &entry.path())?;
+                    }
+                    else if file_type.is_file() {
+                        remove_blob(minigit_path, &entry.path())?;
+                    }
+                    else {
+                        return Err("remove object failed: can't delete symlink file".into());
+                    }
+                    
                 }
-                remove_tree(minigit_path, path)?;
             }
+        }
+        else {
+            remove_tree(minigit_path, path)?;
         }
     }
     else {
-        return Err("save_object failed: Invaid path".into())
+        return Err("remove_object failed: Invaid path".into())
     }
     start_updata_index(minigit_path,path)
 }
@@ -517,11 +592,11 @@ fn rm(paths: &Vec<String>)->Result<(), Box<dyn Error>> {
             Some(name)=> name,
         };
         if file_name == tag{
-            let mut save_path = path.clone();
-            if !save_path.pop() {
+            let mut remove_path = path.clone();
+            if !remove_path.pop() {
                 return Err(r"add failed: path have no parent and end with \. or \*".into());
             }
-            for entry in save_path.read_dir()? {
+            for entry in remove_path.read_dir()? {
                 remove_object(&entry?.path())?;
             }
         }
@@ -559,7 +634,7 @@ fn commit(author: &String, message: &String)-> Result<(), Box<dyn Error>> {
     let mut head = File::open(minigit_path.join("HEAD"))?;
     let mut current_commit = String::new();
     head.read_to_string(&mut current_commit)?;
-    let current_commit = minigit_path.join(&current_commit);
+    let current_commit = minigit_path.join(minigit_path.join("refs").join("heads").join(&current_commit));
     let mut parent_commit = String::new();
     if !current_commit.is_file() {
         parent_commit = "\0".to_string();
@@ -569,7 +644,7 @@ fn commit(author: &String, message: &String)-> Result<(), Box<dyn Error>> {
         head.read_to_string(&mut parent_commit)?;
     }
     let now: DateTime<Utc> = Utc::now();
-    let mut commit_value = format!("commit\0parent {parent_commit}\nauthor {author}\ndatetime {now}\n note {message}\n tree ").into_bytes();
+    let mut commit_value = format!("commit\0parent {parent_commit}\nauthor {author}\ndatetime {now}\nnote {message}\ntree ").into_bytes();
     commit_value.append(&mut tree_key);
     let key = save_value(minigit_path, &commit_value)?;
     let mut head = File::create(&current_commit)?;
@@ -585,7 +660,7 @@ fn branch_create(name: &String)-> Result<(), Box<dyn Error>> {
         return Err("create branch failed: branch {name} is existing, you can't create a existing branch".into());
     }
     let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
-    let last_commit_key = fs::read(minigit_path.join(&now_branch_name))?;
+    let last_commit_key = fs::read(minigit_path.join("refs").join("heads").join(&now_branch_name))?;
     fs::write(branch_path, last_commit_key)?;
     Ok(())
 }
@@ -594,7 +669,6 @@ fn branch_check()-> Result<(), Box<dyn Error>> {
     let minigit_path = find_minigit(&env::current_dir()?)?;
     let branchs_path = minigit_path.join("refs").join("heads");
     let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
-    let now_branch_name = now_branch_name[11..].to_string();
     for entry in branchs_path.read_dir()? {
         let branch_name = entry?.file_name().into_string().unwrap();
         if branch_name == now_branch_name {
@@ -611,7 +685,6 @@ fn branch_delete(name: &String)-> Result<(), Box<dyn Error>> {
     let minigit_path = find_minigit(&env::current_dir()?)?;
     let branchs_path = minigit_path.join("refs").join("heads");
     let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
-    let now_branch_name = now_branch_name[11..].to_string();
     if &now_branch_name == name {
         return Err("delete branch failed: can't delete now branch".into());
     }
@@ -626,7 +699,102 @@ fn branch_delete(name: &String)-> Result<(), Box<dyn Error>> {
     return Err("delete branch failed: no such branch".into());
 }
 
-fn checkout(){}
+fn checkout_new_branch(branch_name: &String)-> Result<(), Box<dyn Error>> {
+    branch_create(branch_name)?;
+    let minigit_path = find_minigit(&env::current_dir()?)?;
+    fs::write(minigit_path.join("HEAD"), &branch_name)?;
+    Ok(())
+}
+
+
+fn get_value_from_key(minigit_path: &PathBuf, key: &String)-> Result<Vec<u8>, std::io::Error> {
+    fs::read(minigit_path.join("objects").join(&key[0..2]).join(&key[2..]))
+}
+
+fn create_file_from_key(minigit_path: &PathBuf, path: &PathBuf, key: &String)-> Result<(), Box<dyn Error>> {
+    let value = & get_value_from_key(minigit_path, key)?;
+    if &value[0..5] != "blob\0".as_bytes() {
+        return Err("create file from key failed: value type isn't blob".into());
+    }
+    // 创建文件并将解压的文件内容写入
+    let mut z = ZlibDecoder::new(File::create(path)?);
+    z.write_all(&value[5..])?;
+    Ok(())
+}
+
+
+fn create_tree_from_key(minigit_path: &PathBuf, path: &PathBuf, key: &String)-> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(path)?;
+    let value = get_value_from_key(minigit_path, key)?;
+    if &value[0..5] != "tree\0".as_bytes() {
+        return Err("create tree from key failed: value type isn't tree".into());
+    }
+    let mut dirs = value[5..].split(|&b| b == b'\0').map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>();
+    dirs.pop();
+    for dir in dirs.iter() {
+        let file_type = &dir[0..4];
+        let file_key = &String::from_utf8(dir[5..45].to_vec())?;
+        let file_name_as_byte = dir[46..].to_vec();
+        let file_name = unsafe{OsString::from_encoded_bytes_unchecked(file_name_as_byte)};
+        let file_path = path.join(file_name);
+        if file_type == b"blob" {
+            create_file_from_key(minigit_path, &file_path, file_key)?;
+        }
+        else if file_type == b"tree" {
+            create_tree_from_key(minigit_path, &file_path, file_key)?;
+        }
+    }
+    Ok(())
+}
+
+
+fn checkout(branch_name: &String)-> Result<(), Box<dyn Error>> {
+    let minigit_path = find_minigit(& env::current_dir()?)?;
+    let root_path = match minigit_path.parent() {
+        None=> return Err("checkout failed: can't get repository path".into()),
+        Some(r)=> r.to_path_buf(),
+    };
+    let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    if &now_branch_name == branch_name {
+        return Ok(());
+    }
+    let branch_path = minigit_path.join("refs").join("heads").join(branch_name);
+    if !branch_path.is_file() {
+        return Err(format!("checkout branch {} failed: no such branch",branch_name).into());
+    }
+    let commit_key = fs::read_to_string(branch_path)?;
+    let commit_value = get_value_from_key(&minigit_path, &commit_key)?;
+    // get root_tree_key
+    let tree_index = commit_value.iter().rposition(|&b| b == b'\n').unwrap();
+    let tree_key = String::from_utf8(commit_value[(tree_index + 6)..].to_vec()).unwrap();
+    // delete_all root_path without minigit path
+    let ignore = OsString::from(".minigit");
+    for entry in root_path.read_dir()? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let file_name = entry.file_name();
+        let file_path = entry.path();
+        if file_type.is_file() {
+            fs::remove_file(file_path)?;
+        }
+        else if file_type.is_dir() {
+            if file_name != ignore {
+                fs::remove_dir_all(file_path)?;
+            }
+        }
+        else {
+            return Err("checkout failed: can't delete symlink file under repository path".into());
+        }
+    }
+    // build new repository without index
+    create_tree_from_key(&minigit_path, &root_path, &tree_key)?;
+    // update index file. how to do? (choose 1 : rm and create a new idnex file ,then save_object(root_path))
+    File::create(minigit_path.join("index"))?;
+    save_object(&root_path)?;
+    // move HEAD ptr
+    fs::write(minigit_path.join("HEAD"), branch_name)?;
+    Ok(())
+}
 
 fn merge(){}
 
@@ -635,7 +803,6 @@ fn merge(){}
 
 #[cfg(test)]
 mod test{
-    use chrono::Timelike;
 
     use super::*;
     #[test]
@@ -705,9 +872,6 @@ mod test{
     #[test]
     fn test_commit()-> std::io::Result<()> {
         test_add()?;
-        rm(&vec!["test_dir\\2.txt".to_string()]).unwrap_or_else(|err|{
-            eprintln!("error at test_rm: {err}");
-        });
         let author_name = "master".to_string();
         let message = "test first commit".to_string();
         commit(&author_name, &message).unwrap_or_else(|err|{
@@ -726,6 +890,34 @@ mod test{
         branch_check()?;
         branch_delete(&"second_branch".to_string())?;
         println!("after delete");
+        branch_check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkout()-> Result<(), Box<dyn Error>> {
+        env::set_current_dir(&env::current_dir()?.join("test"))?;
+        let minigit_path = find_minigit(&env::current_dir()?)?;
+        let root_path = minigit_path.parent().unwrap();
+        rm(&vec!["*".to_string()])?;
+        env::set_current_dir(root_path.parent().unwrap())?;
+        test_commit()?;
+        println!("before create");
+        branch_check()?;
+        branch_create(&"second_branch".to_string())?;
+        println!("after create second branch");
+        branch_check()?;
+        fs::write(root_path.join("master.txt"), "This is master branch")?;
+        add(&vec!["master.txt".to_string()])?;
+        commit(&"master".to_string(), &"master commit".to_string())?;
+        checkout(&"second_branch".to_string())?;
+        println!("after checkout new branch");
+        branch_check()?;
+        fs::write(root_path.join("second.txt"), "Test checkout")?;
+        add(&vec!["second.txt".to_string()])?;
+        commit(&"second".to_string(), &"test_second".to_string())?;
+        checkout(&"master".to_string())?;
+        println!("after checkout master branch");
         branch_check()?;
         Ok(())
     }
