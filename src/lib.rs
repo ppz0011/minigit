@@ -97,9 +97,11 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
                     return Err("minigit branch failed: branch name is empty".into());
                 }
                 branch_delete(&arg[1])?;
+                println!("Successed delete branch {}",&arg[1]);
             }
             else {
                 branch_create(&arg[0])?;
+                println!("Successed create branch {}",&arg[0]);
             }
         },
         "checkout" => {
@@ -110,9 +112,11 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
             }
             else if n >= 2 && arg[0] == "-b"{
                 checkout_new_branch(&arg[1])?;
+                println!("Switched to branch {}", &arg[1]);
             }
             else{
                 checkout(&arg[0])?;
+                println!("Switched to branch {}", &arg[0]);
             }
         },
         "merge" => todo!(),
@@ -683,20 +687,18 @@ fn branch_check()-> Result<(), Box<dyn Error>> {
 
 fn branch_delete(name: &String)-> Result<(), Box<dyn Error>> {
     let minigit_path = find_minigit(&env::current_dir()?)?;
-    let branchs_path = minigit_path.join("refs").join("heads");
+    let branch_path = minigit_path.join("refs").join("heads").join(name);
     let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
     if &now_branch_name == name {
         return Err("delete branch failed: can't delete now branch".into());
     }
-    for entry in branchs_path.read_dir()? {
-        let entry = entry?;
-        let branch_name = entry.file_name().into_string().unwrap();
-        if &branch_name == name {
-            fs::remove_file(entry.path())?;
-            return Ok(());
-        }
+    if branch_path.is_file() {
+        fs::remove_file(branch_path)?;
+        return Ok(())
     }
-    return Err("delete branch failed: no such branch".into());
+    else {
+        return Err("delete branch failed: no such branch".into());
+    }
 }
 
 fn checkout_new_branch(branch_name: &String)-> Result<(), Box<dyn Error>> {
@@ -713,7 +715,7 @@ fn get_value_from_key(minigit_path: &PathBuf, key: &String)-> Result<Vec<u8>, st
 
 fn create_file_from_key(minigit_path: &PathBuf, path: &PathBuf, key: &String)-> Result<(), Box<dyn Error>> {
     let value = & get_value_from_key(minigit_path, key)?;
-    if &value[0..5] != "blob\0".as_bytes() {
+    if &value[0..5] != b"blob\0" {
         return Err("create file from key failed: value type isn't blob".into());
     }
     // 创建文件并将解压的文件内容写入
@@ -726,7 +728,7 @@ fn create_file_from_key(minigit_path: &PathBuf, path: &PathBuf, key: &String)-> 
 fn create_tree_from_key(minigit_path: &PathBuf, path: &PathBuf, key: &String)-> Result<(), Box<dyn Error>> {
     fs::create_dir_all(path)?;
     let value = get_value_from_key(minigit_path, key)?;
-    if &value[0..5] != "tree\0".as_bytes() {
+    if &value[0..5] != b"tree\0" {
         return Err("create tree from key failed: value type isn't tree".into());
     }
     let mut dirs = value[5..].split(|&b| b == b'\0').map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>();
@@ -766,7 +768,7 @@ fn checkout(branch_name: &String)-> Result<(), Box<dyn Error>> {
     let commit_value = get_value_from_key(&minigit_path, &commit_key)?;
     // get root_tree_key
     let tree_index = commit_value.iter().rposition(|&b| b == b'\n').unwrap();
-    let tree_key = String::from_utf8(commit_value[(tree_index + 6)..].to_vec()).unwrap();
+    let tree_key = String::from_utf8(commit_value[(tree_index + 6)..].to_vec())?;
     // delete_all root_path without minigit path
     let ignore = OsString::from(".minigit");
     for entry in root_path.read_dir()? {
@@ -796,7 +798,280 @@ fn checkout(branch_name: &String)-> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn merge(){}
+
+
+
+fn get_parent_commit(minigit_path: &PathBuf, commit_key: &String)-> Result<String, Box<dyn Error>> {
+    let commit_value = get_value_from_key(minigit_path, commit_key)?;
+    if &commit_value[0..7] != b"commit\0" {
+        return Err("get_parent_commit failed: key type isn't commit".into());
+    }
+    if commit_value[14] == b'\0' {
+        return Ok(String::from("\0"));
+    }
+    return Ok(String::from_utf8(commit_value[14..54].to_vec())?);
+}
+
+fn find_both_ancestor(minigit_path: &PathBuf, commit_key1: &String, commit_key2: &String)-> Result<String, Box<dyn Error>> {
+    let mut k1 = commit_key1.clone();
+    let mut k2 = commit_key2.clone();
+    while k1 != k2 {
+        if k1 == "\0".to_string() {
+            k1 = commit_key2.clone();
+        }
+        else {
+            k1 = get_parent_commit(minigit_path, &k1)?;
+        }
+        if k2 == "\0".to_string() {
+            k2 = commit_key1.clone();
+        }
+        else {
+            k2 = get_parent_commit(minigit_path, &k2)?;
+        }
+    }
+    Ok(k1)
+}
+
+
+fn merge_blob(minigit_path: &PathBuf, path: &PathBuf, blobs_key: &Vec<String>)-> Result<bool, Box<dyn Error>> {
+    let mut blobs_value: Vec<Vec<&str>> = Vec::new();
+    let mut re = true;
+    for key in blobs_key {
+        let buf = get_value_from_key(minigit_path, key)?;
+        // 解压value
+        let mut z = flate2::read::ZlibDecoder::new(&buf[..]);
+        let mut value = String::new();
+        z.read_to_string(&mut value)?;
+        let value_line: Vec<&str>;
+        if value[0..5] != "blob\0".to_string() {
+            return Err("merge blob failed: key type is not blob".into());
+        }
+        if value.len() == 5 {
+            value_line = Vec::new();
+        }
+        else {
+            value_line = value[5..].split('\n').collect::<Vec<&str>>();
+        }
+        blobs_value.push(value_line);
+    }
+    // 合并文件数据，并且标出冲突
+    todo!();
+}
+
+
+fn merge_tree(minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)-> Result<bool, Box<dyn Error>> {
+    fs::create_dir_all(&path)?;
+    let mut re = true;
+    let mut trees_value: Vec<Vec<Vec<u8>>> = Vec::new();
+    for key in trees_key {
+        let mut buf = get_value_from_key(minigit_path, key)?;
+        let mut value: Vec<Vec<u8>>;
+        if &buf[0..5] != b"tree\0" {
+            return Err("merge tree failed: key type is not tree".into());
+        }
+        if buf.len() == 5 {
+            value = Vec::new();
+        }
+        else {
+            buf.pop();
+            value = buf[5..].split(|&b| b == b'\0').map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>();
+            value.sort_unstable_by(|x,y| {
+                                        let ord = x[46..].cmp(&y[46..]);
+                                        match ord {
+                                            Ordering::Equal => return x[0..4].cmp(&y[0..4]),
+                                            _=> return ord, 
+                                        }});
+        }
+        trees_value.push(value);
+    }
+    let (v1, v2) = (&trees_value[0], &trees_value[1]);
+    let (n1, n2)  = (v1.len(), v2.len());
+    let (mut it1, mut it2) = (0, 0);
+    while it1 < n1 && it2 < n2 {
+        let (type1, key1, name1) = (&v1[it1][..4], &v1[it1][5..45], &v1[it1][46..]);
+        let (type2, key2, name2) = (&v2[it2][..4], &v2[it2][5..45], &v2[it2][46..]);
+        let mut ord = name1.cmp(name2);
+        if let Ordering::Equal = ord {
+            ord = type1.cmp(type2);
+        }
+        match ord {
+            Ordering::Equal=> {
+                it1 = it1 + 1;
+                it2 = it2 + 1;
+                let mut keys: Vec<String> = vec![String::from_utf8(key1.to_vec())?, String::from_utf8(key2.to_vec())?];
+                if trees_value.len() == 3 {
+                    let com = trees_value[2].iter().find(|&x| &x[46..] == name1 && &x[..4] == type1);
+                    if let Some(c) = com {
+                        keys.push(String::from_utf8(c[5..45].to_vec())?);
+                    }
+                }
+                let name = unsafe{OsString::from_encoded_bytes_unchecked(name1.to_vec())};
+                if type1 == b"tree" {
+                    re = re && merge_tree(minigit_path, &path.join(&name), &keys)?;
+                }
+                else {
+                    re = re && merge_blob(minigit_path, &path.join(&name), &keys)?;
+                }
+            },
+            Ordering::Less=> {
+                it1 = it1 + 1;
+                let mut is_file_in_common_commit = false;
+                if trees_value.len() == 3 {
+                    let com = trees_value[2].iter().find(|&x| &x[46..] == name1 && &x[..4] == type1);
+                    if let Some(_unused) = com {
+                        is_file_in_common_commit = true;
+                    }
+                }
+                let name = unsafe{OsString::from_encoded_bytes_unchecked(name1.to_vec())};
+                if !is_file_in_common_commit {
+                    if type1 == b"tree" {
+                        create_tree_from_key(minigit_path, &path.join(&name), &String::from_utf8(key1.to_vec())?)?;
+                    }
+                    else {
+                        create_file_from_key(minigit_path, &path.join(&name), &String::from_utf8(key1.to_vec())?)?;
+                    }
+                }
+            },
+            Ordering::Greater=> {
+                it2 = it2 + 1;
+                let mut is_file_in_common_commit = false;
+                if trees_value.len() == 3 {
+                    let com = trees_value[2].iter().find(|&x| &x[46..] == name2 && &x[..4] == type2);
+                    if let Some(_unused) = com {
+                        is_file_in_common_commit = true;
+                    }
+                }
+                let name = unsafe{OsString::from_encoded_bytes_unchecked(name2.to_vec())};
+                if !is_file_in_common_commit {
+                    if type2 == b"tree" {
+                        create_tree_from_key(minigit_path, &path.join(&name), &String::from_utf8(key2.to_vec())?)?;
+                    }
+                    else {
+                        create_file_from_key(minigit_path, &path.join(&name), &String::from_utf8(key2.to_vec())?)?;
+                    }
+                }
+            },
+        }
+    }
+    // 这两个循环只可能运行一个
+    while it1 < n1 {
+        let (type1, key1, name1) = (&v1[it1][..4], &v1[it1][5..45], &v1[it1][46..]);
+        it1 = it1 + 1;
+        let mut is_file_in_common_commit = false;
+        if trees_value.len() == 3 {
+            let com = trees_value[2].iter().find(|&x| &x[46..] == name1 && &x[..4] == type1);
+            if let Some(_unused) = com {
+                is_file_in_common_commit = true;
+            }
+        }
+        let name = unsafe{OsString::from_encoded_bytes_unchecked(name1.to_vec())};
+        if !is_file_in_common_commit {
+            if type1 == b"tree" {
+                create_tree_from_key(minigit_path, &path.join(&name), &String::from_utf8(key1.to_vec())?)?;
+            }
+            else {
+                create_file_from_key(minigit_path, &path.join(&name), &String::from_utf8(key1.to_vec())?)?;
+            }
+        }
+    }
+    // 这两个循环只可能运行一个
+    while it2 < n2 {
+        let (type2, key2, name2) = (&v2[it2][..4], &v2[it2][5..45], &v2[it2][46..]);
+        it2 = it2 + 1;
+        let mut is_file_in_common_commit = false;
+        if trees_value.len() == 3 {
+            let com = trees_value[2].iter().find(|&x| &x[46..] == name2 && &x[..4] == type2);
+            if let Some(_unused) = com {
+                is_file_in_common_commit = true;
+            }
+        }
+        let name = unsafe{OsString::from_encoded_bytes_unchecked(name2.to_vec())};
+        if !is_file_in_common_commit {
+            if type2 == b"tree" {
+                create_tree_from_key(minigit_path, &path.join(&name), &String::from_utf8(key2.to_vec())?)?;
+            }
+            else {
+                create_file_from_key(minigit_path, &path.join(&name), &String::from_utf8(key2.to_vec())?)?;
+            }
+        }
+    }
+    Ok(re)
+}
+
+
+
+fn merge(branch_name: &String)-> Result<(), Box<dyn Error>> {
+    let minigit_path = find_minigit(&env::current_dir()?)?;
+    let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+    if *branch_name == now_branch_name {
+        return Ok(())
+    }
+    let branchs_path = minigit_path.join("refs").join("heads");
+    let now_branch_path = branchs_path.join(&now_branch_name);
+    let branch_path = branchs_path.join(branch_name);
+    if !branch_path.is_file() {
+        return Err(format!("merge failed: no such branch named {branch_name}").into());
+    }
+    if !now_branch_path.is_file() {
+        return Err("merge failed: can't find now branch".into());
+    }
+    let commit_key = fs::read_to_string(&branch_path)?;
+    let now_commit_key = fs::read_to_string(&now_branch_path)?;
+    let common_commit_key = find_both_ancestor(&minigit_path, &commit_key, &now_commit_key)?;
+    if common_commit_key == "\0".to_string() {
+        return Err(format!("merge failed: branch {branch_name} and branch {now_branch_name} have no common ancestor commit").into());
+    }
+    // 如果没有分支，则快速合并，将指针移动到最新提交即可
+    if common_commit_key == commit_key {
+        // 说明此时已经在最新提交上，不用操作直接返回
+        return Ok(())
+    }
+    if common_commit_key == now_commit_key {
+        // 说明此时要合并的分支比现在的分支进度更远，将指针移动到要合并的分支的最新提交即可
+        fs::write(&now_branch_path, &commit_key)?;
+    }
+    // 如果有分支，则需要三路合并
+    // 获得三个提交的tree-key
+    let commits_key = vec![&now_commit_key, &commit_key, &common_commit_key];
+    let mut trees_key = Vec::new();
+    for key in commits_key {
+        let value = get_value_from_key(&minigit_path, key)?;
+        let tree_index = value.iter().rposition(|&b| b == b'\n').unwrap();
+        let tree_key = String::from_utf8(value[(tree_index + 6)..].to_vec())?;
+        trees_key.push(tree_key);
+    }
+    // delete_all root_path without minigit path
+    let root_path = match minigit_path.parent() {
+        None=> return Err("checkout failed: can't get repository path".into()),
+        Some(r)=> r.to_path_buf(),
+    };
+    let ignore = OsString::from(".minigit");
+    for entry in root_path.read_dir()? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let file_name = entry.file_name();
+        let file_path = entry.path();
+        if file_type.is_file() {
+            fs::remove_file(file_path)?;
+        }
+        else if file_type.is_dir() {
+            if file_name != ignore {
+                fs::remove_dir_all(file_path)?;
+            }
+        }
+        else {
+            return Err("checkout failed: can't delete symlink file under repository path".into());
+        }
+    }
+    // 进行三路合并
+    let no_conflict = merge_tree(&minigit_path, &root_path, &trees_key)?;
+    // 提交合并后的工作目录
+    if no_conflict {
+        let author = env::var("USERNAME")?;
+        commit(&author, &format!("merge {branch_name} to {now_branch_name}"))?;
+    }
+    Ok(())
+}
 
 
 
