@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::{env,fs, path};
 use std::fs::File;
@@ -119,7 +120,12 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
                 println!("Switched to branch {}", &arg[0]);
             }
         },
-        "merge" => todo!(),
+        "merge" => {
+            if config.argument.is_empty() {
+                return Err("Please input merge branch name".into());
+            }
+            merge(&config.argument[0])?;
+        },
         _=> return Err("inviald operater string".into()),
     }
     Ok(())
@@ -833,37 +839,96 @@ fn find_both_ancestor(minigit_path: &PathBuf, commit_key1: &String, commit_key2:
 }
 
 
-fn merge_blob(minigit_path: &PathBuf, path: &PathBuf, blobs_key: &Vec<String>)-> Result<bool, Box<dyn Error>> {
-    let mut blobs_value: Vec<Vec<&str>> = Vec::new();
-    let mut re = true;
-    for key in blobs_key {
+
+fn get_diff_from_vec<T>(v1: &Vec<T>, v2: &Vec<T>)-> Result<Vec<T>, Box<dyn Error>> {
+    todo!();
+}
+
+fn diff(minigit_path: &PathBuf, key1: &String, key2: &String)-> Result<Vec<u8>, Box<dyn Error>> {
+    let mut blobs_value = Vec::new();
+    for key in vec![key1, key2] {
         let buf = get_value_from_key(minigit_path, key)?;
         // 解压value
         let mut z = flate2::read::ZlibDecoder::new(&buf[..]);
-        let mut value = String::new();
-        z.read_to_string(&mut value)?;
-        let value_line: Vec<&str>;
-        if value[0..5] != "blob\0".to_string() {
+        let mut value = Vec::new();
+        z.read(&mut value)?;
+        let value_line: Vec<Vec<u8>>;
+        if &value[0..5] != b"blob\0" {
             return Err("merge blob failed: key type is not blob".into());
         }
         if value.len() == 5 {
             value_line = Vec::new();
         }
         else {
-            value_line = value[5..].split('\n').collect::<Vec<&str>>();
+            value_line = value[5..].split(|&b| b == b'\n').map(|str| str.to_vec()).collect::<Vec<Vec<u8>>>();
         }
         blobs_value.push(value_line);
     }
-    // 合并文件数据，并且标出冲突
+    // 对比两个向量，通过算法找到不同
+    let _re = get_diff_from_vec(&blobs_value[0], &blobs_value[1])?;
     todo!();
 }
 
 
-fn merge_tree(minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)-> Result<bool, Box<dyn Error>> {
+
+
+fn merge_blob(branch_name: &String, minigit_path: &PathBuf, path: &PathBuf, blobs_key: &Vec<String>)-> Result<bool, Box<dyn Error>> {
+    let mut blobs_value: Vec<Vec<u8>> = Vec::new();
+    let mut no_conflict = true;
+    for key in blobs_key {
+        let buf = get_value_from_key(minigit_path, key)?;
+        if &buf[..5] != b"blob\0" {
+            return Err("merge blob failed: key type is not blob".into());
+        }
+        // 解压value
+        let mut z = flate2::read::ZlibDecoder::new(&buf[5..]);
+        let mut value = Vec::new();
+        z.read_to_end(&mut value)?;
+        blobs_value.push(value);
+    }
+    // 合并文件数据，并且标出冲突
+    let file_value;
+    if blobs_key[0] == blobs_key[1] {
+        file_value = blobs_value[0].clone();
+    }
+    else {
+        no_conflict = false;
+        println!("Conflict at: {}", path.display());
+        let now_branch_name = fs::read_to_string(minigit_path.join("HEAD"))?;
+        let mut v = vec![format!("========== {now_branch_name}").into_bytes(), blobs_value[0].clone(),
+                                   format!("========== {branch_name}").into_bytes(), blobs_value[1].clone()];
+        if blobs_key.len() == 3 {
+            v.push(b"========== common ancestor".to_vec());
+            v.push(blobs_value[2].clone());
+        }
+        file_value = v.join(&b'\n');
+    }
+    fs::write(path, &file_value)?;
+    Ok(no_conflict)
+}
+
+
+fn merge_tree(branch_name: &String, minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)-> Result<bool, Box<dyn Error>> {
     fs::create_dir_all(&path)?;
     let mut re = true;
     let mut trees_value: Vec<Vec<Vec<u8>>> = Vec::new();
-    for key in trees_key {
+    let mut hashmap: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    if trees_key.len() == 3 {
+        let mut buf = get_value_from_key(minigit_path, &trees_key[2])?;
+        if &buf[0..5] != b"tree\0" {
+            return Err("merge tree failed: key type is not tree".into());
+        }
+        if buf.len() > 5 {
+            buf.pop();
+            for common_value in buf[5..].split(|&b| b == b'\0') {
+                let mut map_key = common_value[46..].to_vec();
+                map_key.append(&mut common_value[..4].to_vec());
+                let map_value = common_value[5..45].to_vec();
+                hashmap.insert(map_key, map_value);
+            }
+        }
+    }
+    for key in &trees_key[..2] {
         let mut buf = get_value_from_key(minigit_path, key)?;
         let mut value: Vec<Vec<u8>>;
         if &buf[0..5] != b"tree\0" {
@@ -899,26 +964,30 @@ fn merge_tree(minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)->
                 it1 = it1 + 1;
                 it2 = it2 + 1;
                 let mut keys: Vec<String> = vec![String::from_utf8(key1.to_vec())?, String::from_utf8(key2.to_vec())?];
-                if trees_value.len() == 3 {
-                    let com = trees_value[2].iter().find(|&x| &x[46..] == name1 && &x[..4] == type1);
-                    if let Some(c) = com {
-                        keys.push(String::from_utf8(c[5..45].to_vec())?);
+                if trees_key.len() == 3 {
+                    let mut com_key = name1.to_vec();
+                    com_key.append(&mut type1.to_vec());
+                    let com_value = hashmap.get(&com_key);
+                    if let Some(c) = com_value {
+                        keys.push(String::from_utf8(c.clone())?);
                     }
                 }
                 let name = unsafe{OsString::from_encoded_bytes_unchecked(name1.to_vec())};
                 if type1 == b"tree" {
-                    re = re && merge_tree(minigit_path, &path.join(&name), &keys)?;
+                    re = re && merge_tree(branch_name, minigit_path, &path.join(&name), &keys)?;
                 }
                 else {
-                    re = re && merge_blob(minigit_path, &path.join(&name), &keys)?;
+                    re = re && merge_blob(branch_name, minigit_path, &path.join(&name), &keys)?;
                 }
             },
             Ordering::Less=> {
                 it1 = it1 + 1;
                 let mut is_file_in_common_commit = false;
-                if trees_value.len() == 3 {
-                    let com = trees_value[2].iter().find(|&x| &x[46..] == name1 && &x[..4] == type1);
-                    if let Some(_unused) = com {
+                if trees_key.len() == 3 {
+                    let mut com_key = name1.to_vec();
+                    com_key.append(&mut type1.to_vec());
+                    let com_value = hashmap.get(&com_key);
+                    if let Some(_c) = com_value {
                         is_file_in_common_commit = true;
                     }
                 }
@@ -935,9 +1004,11 @@ fn merge_tree(minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)->
             Ordering::Greater=> {
                 it2 = it2 + 1;
                 let mut is_file_in_common_commit = false;
-                if trees_value.len() == 3 {
-                    let com = trees_value[2].iter().find(|&x| &x[46..] == name2 && &x[..4] == type2);
-                    if let Some(_unused) = com {
+                if trees_key.len() == 3 {
+                    let mut com_key = name2.to_vec();
+                    com_key.append(&mut type2.to_vec());
+                    let com_value = hashmap.get(&com_key);
+                    if let Some(_c) = com_value {
                         is_file_in_common_commit = true;
                     }
                 }
@@ -958,9 +1029,11 @@ fn merge_tree(minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)->
         let (type1, key1, name1) = (&v1[it1][..4], &v1[it1][5..45], &v1[it1][46..]);
         it1 = it1 + 1;
         let mut is_file_in_common_commit = false;
-        if trees_value.len() == 3 {
-            let com = trees_value[2].iter().find(|&x| &x[46..] == name1 && &x[..4] == type1);
-            if let Some(_unused) = com {
+        if trees_key.len() == 3 {
+            let mut com_key = name1.to_vec();
+            com_key.append(&mut type1.to_vec());
+            let com_value = hashmap.get(&com_key);
+            if let Some(_c) = com_value {
                 is_file_in_common_commit = true;
             }
         }
@@ -979,9 +1052,11 @@ fn merge_tree(minigit_path: &PathBuf, path: &PathBuf, trees_key: &Vec<String>)->
         let (type2, key2, name2) = (&v2[it2][..4], &v2[it2][5..45], &v2[it2][46..]);
         it2 = it2 + 1;
         let mut is_file_in_common_commit = false;
-        if trees_value.len() == 3 {
-            let com = trees_value[2].iter().find(|&x| &x[46..] == name2 && &x[..4] == type2);
-            if let Some(_unused) = com {
+        if trees_key.len() == 3 {
+            let mut com_key = name2.to_vec();
+            com_key.append(&mut type2.to_vec());
+            let com_value = hashmap.get(&com_key);
+            if let Some(_c) = com_value {
                 is_file_in_common_commit = true;
             }
         }
@@ -1064,7 +1139,7 @@ fn merge(branch_name: &String)-> Result<(), Box<dyn Error>> {
         }
     }
     // 进行三路合并
-    let no_conflict = merge_tree(&minigit_path, &root_path, &trees_key)?;
+    let no_conflict = merge_tree(branch_name, &minigit_path, &root_path, &trees_key)?;
     // 提交合并后的工作目录
     if no_conflict {
         let author = env::var("USERNAME")?;
@@ -1194,6 +1269,33 @@ mod test{
         checkout(&"master".to_string())?;
         println!("after checkout master branch");
         branch_check()?;
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_merge()-> Result<(), Box<dyn Error>> {
+        test_commit()?;
+        let root_path = env::current_dir()?;
+        println!("root path = {}", root_path.display());
+        println!("before create");
+        branch_check()?;
+        branch_create(&"second_branch".to_string())?;
+        println!("after create");
+        branch_check()?;
+        fs::write(&root_path.join("test_merge.txt"), &"my\nfirst\ntest\nmerge\nin\nbranch\nmaster".as_bytes())?;
+        fs::create_dir_all(&root_path.join("test_master"))?;
+        add(&vec!["*".to_string()])?;
+        commit(&"master".to_string(), &"master_commmit".to_string())?;
+        checkout(&"second_branch".to_string())?;
+        println!("after checkout");
+        branch_check()?;
+        fs::write(&root_path.join("test_merge.txt"), &"my\nfirst\ntest\nmerge\nin\nbranch\nsecond branch".as_bytes())?;
+        fs::create_dir_all(&root_path.join("test_second"))?;
+        add(&vec!["*".to_string()])?;
+        commit(&"second branch".to_string(), &"second_commit".to_string())?;
+        println!("ready to merge");
+        merge(&"master".to_string())?;
         Ok(())
     }
 
