@@ -21,7 +21,7 @@ impl Config{
      *  'build'将minigit指令（通常是命令行输入）装配为Config（配置）
      * # 示例
      * ```
-     * let v = vec!["init","test"];
+        let v = vec!["init","test"];
         let it = v.iter().map(|x|{x.to_string()});
         let config = Config::build(it).unwrap_or_else(|err| {
             eprintln!("error at test build: {err}");
