@@ -20,7 +20,7 @@ impl Config{
     /**
      *  'build'将minigit指令（通常是命令行输入）装配为Config（配置）
      * # 示例
-     * '''
+     * ```
      * let v = vec!["init","test"];
         let it = v.iter().map(|x|{x.to_string()});
         let config = Config::build(it).unwrap_or_else(|err| {
@@ -28,7 +28,7 @@ impl Config{
             std::process::exit(1);
         });
         assert_eq!((config.operate,config.argument),(String::from("init"),String::from("test")));
-     * '''
+     * ```
      */
     pub fn build(mut args: impl Iterator<Item = String>)-> Result<Config, &'static str>{
         args.next();
@@ -53,7 +53,7 @@ impl Config{
 
 /** 'run' 通过输入配置，通过运行对应函数来实现对应的minigit指令 \\
  * # 示例
- * '''
+ * ```
     let config: Config = Config{operate:"init".to_string(), argument:"test".to_string()};
     run(config);
     let path =  std::env::current_dir().unwrap_or_else(|err|{
@@ -61,7 +61,7 @@ impl Config{
         std::process::exit(1);
     });
     assert!(path.join(config.argument).exists());      
- * '''
+ * ```
  */
 pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
     match &config.operate as &str{
@@ -136,14 +136,14 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
 /**
  * 'init'根据输入的仓库名字创建minigit仓库，如果该仓库已经存在会将配置初始化，仓库内容不变
  * # 示例
- * '''
+ * ```
  *      let name = "test".to_string();
         let _unused = init(name).unwrap_or_else(|err|{
             eprintln!("error at test_init: {err}");
         });
         let path = env::current_dir().unwrap();
         assert!(path.join("test").is_dir());
- * '''
+ * ```
  */
 fn init(name: &String)-> Result<(), Box<dyn Error>>{
     let path = env::current_dir()?.join(name).join(".minigit");
@@ -198,7 +198,11 @@ fn find_minigit(path: &PathBuf)-> Result<PathBuf, Box<dyn Error>>{
 }
 
 
-
+/**
+ * 给定一个向量buf，使用二分查找在里面寻找path_str，返回下标（start, end）
+ * 如果start <= end 则说明要找的元素在向量里面，且下标为（start + end） / 2
+ * 如果start > end 则必定end == start - 1且要找的元素不在向量里面，而且有buf[end] < path_str < buf[start]
+ */
 fn find_index(buf: &Vec<Vec<u8>>, path_str: &Vec<u8>)-> (usize, i32) {
     if buf.len() == 0 {
         return (0,-1);
@@ -229,7 +233,7 @@ fn find_index(buf: &Vec<Vec<u8>>, path_str: &Vec<u8>)-> (usize, i32) {
 }
 
 /**
- * 从路径path开始通过index里面的记录而不是文件系统来更新index内容（即buf）
+ * 从路径path开始通过index里面的记录而不是实际文件系统来更新index内容（即buf）
  * 
  */
 fn updata_index(buf: &mut Vec<Vec<u8>>, path: &PathBuf, root_path: &Path)-> Result<(), Box<dyn Error>> {
@@ -280,6 +284,8 @@ fn updata_index(buf: &mut Vec<Vec<u8>>, path: &PathBuf, root_path: &Path)-> Resu
     }
     updata_index(buf, &path, root_path)
 }
+
+
 
 fn start_updata_index(minigit_path: &PathBuf, path: &PathBuf)-> Result<(), Box<dyn Error>> {
     let root_path = match minigit_path.parent() {
