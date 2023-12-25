@@ -93,7 +93,7 @@ pub fn run(config: &Config)-> Result<(), Box<dyn Error>>{
             if arg.is_empty() {
                 branch_check()?;
             }
-            else if arg[0] == "-v".to_string() {
+            else if arg[0] == "-d".to_string() {
                 if arg.len() < 2 {
                     return Err("minigit branch failed: branch name is empty".into());
                 }
